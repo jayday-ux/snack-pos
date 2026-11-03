@@ -44,6 +44,12 @@ nav button.on{color:var(--lime);font-weight:600}
 #scan{position:fixed;top:0;left:0;right:0;height:38vh;background:#000;z-index:20;display:none}
 body.scanning #scan{display:block}
 #reader{width:100%;height:100%}
+#scan::after{content:"";position:absolute;inset:0;pointer-events:none;opacity:0;z-index:1}
+#scan.okf::after{background:rgba(43,138,62,.6);animation:fl .5s}
+#scan.badf::after{background:rgba(217,72,15,.6);animation:fl .5s}
+#scanMsg{position:absolute;left:10px;right:10px;bottom:10px;z-index:2;padding:10px 12px;border-radius:12px;font-weight:800;font-size:18px;text-align:center;color:#fff;display:none}
+#scanMsg.ok{background:var(--ok)}#scanMsg.bad{background:var(--warn)}
+@keyframes fl{0%{opacity:1}100%{opacity:0}}
 #scan .x{position:absolute;right:10px;top:10px;z-index:2;background:#fff;border-radius:20px;padding:6px 14px}
 #toast{position:fixed;left:50%;bottom:150px;transform:translate(-50%,20px);background:var(--ink);color:#fff;padding:10px 18px;border-radius:20px;opacity:0;pointer-events:none;transition:.25s;z-index:30;max-width:90vw;text-align:center}
 #toast.show{opacity:1;transform:translate(-50%,0)}
@@ -84,13 +90,14 @@ body.scanning #scan{display:block}
 </style>
 </head>
 <body>
-<div id="scan"><button class="x" onclick="closeScanner()">ปิดกล้อง</button><div id="reader"></div></div>
+<div id="scan"><button class="x" onclick="closeScanner()">ปิดกล้อง</button><div id="reader"></div><div id="scanMsg"></div></div>
 <header><h1>POS ร้านขนม</h1><button id="badge" onclick="show('sell')">ตะกร้า 0</button></header>
 
 <section id="v-sell" class="on">
   <div class="row"><button class="btn" onclick="openScanner(handleCode)">สแกน</button>
   <input id="q" placeholder="พิมพ์ชื่อ/รหัส หรือยิงเครื่องสแกน" autocomplete="off"></div>
   <label class="swt"><input type="checkbox" id="instant"><span>ขายทันทีเมื่อสแกน (ไม่ต้องกดขาย)</span></label>
+  <label class="swt"><input type="checkbox" id="autoclose"><span>ปิดกล้องและไปที่ตะกร้าหลังสแกนติด</span></label>
   <div id="found" class="chips"></div>
   <div id="lows"></div>
   <div id="cart"></div>
@@ -101,7 +108,7 @@ body.scanning #scan{display:block}
 
 <section id="v-manage">
   <div class="grid2">
-    <div style="display:flex;gap:6px"><input id="f-code" placeholder="รหัส/บาร์โค้ด"><button class="btn" onclick="openScanner(c=>{$('#f-code').value=c;closeScanner()})">สแกน</button></div>
+    <div style="display:flex;gap:6px"><input id="f-code" placeholder="รหัส/บาร์โค้ด"><button class="btn" onclick="openScanner(c=>{feedback(true,'✓ '+c);$('#f-code').value=c;setTimeout(closeScanner,700)})">สแกน</button></div>
     <input id="f-name" placeholder="ชื่อขนม">
     <input id="f-price" type="number" inputmode="decimal" placeholder="ราคา (บาท)">
     <input id="f-stock" type="number" inputmode="numeric" placeholder="สต็อก">
@@ -175,22 +182,31 @@ function show(v) {
 // ===== สแกน =====
 let qr = null, scanCb = null, lastCode = '', lastAt = 0;
 async function openScanner(cb) {
-  scanCb = cb;
+  scanCb = cb; closing = false; lastCode = '';
   document.body.classList.add('scanning');
   try {
     if (!qr) {
       const F = Html5QrcodeSupportedFormats;
       qr = new Html5Qrcode('reader', { formatsToSupport: [F.EAN_13, F.EAN_8, F.UPC_A, F.UPC_E, F.CODE_128, F.CODE_39, F.QR_CODE], experimentalFeatures: { useBarCodeDetectorIfSupported: true } });
     }
-    if (!qr.isScanning) await qr.start({ facingMode: 'environment' }, { fps: 10, qrbox: { width: 260, height: 120 } }, onScan);
+    try { actx = actx || new (window.AudioContext || window.webkitAudioContext)(); actx.resume(); } catch (e) {}
+    if (!qr.isScanning) {
+      const box = (w, h) => ({ width: Math.floor(w * 0.9), height: Math.floor(h * 0.75) });
+      try {   // ภาพความละเอียดสูง + โฟกัสต่อเนื่อง
+        await qr.start({ facingMode: 'environment' }, { fps: 15, qrbox: box, videoConstraints: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 }, advanced: [{ focusMode: 'continuous' }] } }, onScan);
+      } catch (e1) {
+        await qr.start({ facingMode: 'environment' }, { fps: 15, qrbox: box }, onScan);
+      }
+    }
   } catch (e) {
     toast('เปิดกล้องไม่ได้ ให้กด "อนุญาต" การใช้กล้องในเบราว์เซอร์');
     closeScanner();
   }
 }
 function onScan(code) {
+  if (closing) return;
   const n = Date.now();
-  if (code === lastCode && n - lastAt < 1800) { lastAt = n; return; }
+  if (code === lastCode && n - lastAt < 1200) { lastAt = n; return; }
   lastCode = code; lastAt = n;
   scanCb && scanCb(code);
 }
@@ -200,21 +216,46 @@ async function closeScanner() {
 }
 
 // ===== หน้าขาย =====
+let actx = null;
+function beep(ok) {
+  try {
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.frequency.value = ok ? 1100 : 280; g.gain.value = 0.2;
+    o.connect(g); g.connect(actx.destination); o.start(); o.stop(actx.currentTime + (ok ? 0.12 : 0.35));
+  } catch (e) {}
+}
+function feedback(ok, msg) {     // เสียง + สั่น + แฟลชสี + ข้อความบนกล้อง
+  beep(ok);
+  navigator.vibrate && navigator.vibrate(ok ? 60 : [80, 60, 80]);
+  const s = $('#scan'), m = $('#scanMsg');
+  s.classList.remove('okf', 'badf'); void s.offsetWidth; s.classList.add(ok ? 'okf' : 'badf');
+  m.className = ok ? 'ok' : 'bad'; m.textContent = msg; m.style.display = 'block';
+  clearTimeout(feedback.t); feedback.t = setTimeout(() => m.style.display = 'none', 1600);
+}
 function handleCode(code) {
   const p = find(code);
-  if (!p) { toast('ไม่พบรหัส ' + code + ' ไปเพิ่มที่แท็บ "สินค้า"'); navigator.vibrate && navigator.vibrate([80, 60, 80]); return; }
-  addToCart(p.code);
-  navigator.vibrate && navigator.vibrate(50);
-  if ($('#instant').checked && cart[p.code]) checkout();   // โหมดขายทันที
+  if (!p) { feedback(false, '✗ ไม่พบรหัส ' + code); toast('ไม่พบรหัส ' + code + ' ไปเพิ่มที่แท็บ "สินค้า"'); return; }
+  if (!addToCart(p.code)) { feedback(false, '✗ ' + p.name + ' สต็อกไม่พอ'); return; }
+  const q = cart[p.code], instant = $('#instant').checked;
+  feedback(true, instant ? '✓ ขาย ' + p.name + ' ' + baht(p.price) : '✓ ' + p.name + ' ×' + q);
+  if (instant) checkout();   // โหมดขายทันที
+  if ($('#autoclose').checked) {   // ปิดกล้องแล้วเด้งไปที่ตะกร้า
+    closing = true;
+    setTimeout(async () => { await closeScanner(); window.scrollTo({ top: 0, behavior: 'smooth' }); }, 700);
+  }
 }
+let closing = false;
+$('#autoclose').checked = localStorage.getItem('autoclose') !== '0';   // เปิดไว้เป็นค่าเริ่มต้น
+$('#autoclose').addEventListener('change', e => localStorage.setItem('autoclose', e.target.checked ? '1' : '0'));
 $('#instant').checked = localStorage.getItem('instant') === '1';
 $('#instant').addEventListener('change', e => localStorage.setItem('instant', e.target.checked ? '1' : '0'));
 function addToCart(code) {
-  const p = find(code); if (!p) return;
+  const p = find(code); if (!p) return false;
   const q = (cart[code] || 0) + 1;
-  if (q > p.stock) { toast(p.name + ' เหลือ ' + p.stock + ' ชิ้น'); return; }
+  if (q > p.stock) { toast(p.name + ' เหลือ ' + p.stock + ' ชิ้น'); return false; }
   cart[code] = q; renderCart();
   const b = $('#badge'); b.classList.remove('bump'); void b.offsetWidth; b.classList.add('bump');
+  return true;
 }
 function setQty(code, d) {
   const p = find(code), q = (cart[code] || 0) + d;
