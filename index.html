@@ -81,6 +81,15 @@ body.scanning #scan{display:block}
 .add:disabled{background:#6b7a60}
 /* จัดการ */
 .list .item{cursor:pointer;grid-template-columns:1fr auto}
+.qstat{display:none;margin:0 16px 10px;padding:8px 12px;border-radius:12px;background:#fff0e6;border:2px solid #ffc9a8;color:var(--warn);font-size:14px;text-align:center}
+#sumBox .tab{background:#fff;border:2px solid var(--line)}
+#sumBox .tab.on{background:var(--deep);border-color:var(--deep)}
+.bars{display:flex;align-items:flex-end;gap:3px;height:130px;background:#fff;border-radius:14px;padding:10px 8px 4px;margin-bottom:10px;overflow-x:auto}
+.bar{flex:1;min-width:10px;height:100%;display:flex;flex-direction:column;align-items:center;font-size:10px;color:#7b6b72}
+.bf{flex:1;width:100%;display:flex;align-items:flex-end}
+.bf i{display:block;width:100%;background:var(--pink);border-radius:4px 4px 0 0}
+.bar span{height:14px;line-height:14px}
+.qstat.bad{background:var(--warn);color:#fff;border-color:var(--warn)}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px}
 .sum{background:var(--deep);color:var(--lime);border-radius:20px;padding:20px;margin-bottom:14px}
 .sum b{font-size:40px;display:block}
@@ -98,6 +107,7 @@ body.scanning #scan{display:block}
 <body>
 <div id="scan"><button class="x" onclick="closeScanner()">ปิดกล้อง</button><div class="ctl"><button id="zoomBtn" style="display:none"></button><button id="torchBtn" style="display:none"></button></div><div id="reader"></div><div class="aim"></div><div id="scanMsg"></div></div>
 <header><h1>POS ร้านขนม</h1><button id="badge" onclick="show('sell')">ตะกร้า 0</button></header>
+<div id="qstat" class="qstat" onclick="showFailed()"></div>
 
 <section id="v-sell" class="on">
   <div class="row"><button class="btn" onclick="openScanner(handleCode)">สแกน</button>
@@ -125,6 +135,8 @@ body.scanning #scan{display:block}
   <div class="row"><button class="btn pink" onclick="saveProduct()">บันทึกสินค้า</button>
   <button class="btn ghost" onclick="clearForm()">ล้างฟอร์ม</button>
   <button class="btn ghost" onclick="printLabels()">พิมพ์สติกเกอร์</button></div>
+  <div class="row"><input id="f-add" type="number" inputmode="numeric" placeholder="จำนวนรับเข้า (ใช้รหัสด้านบน)">
+  <button class="btn" onclick="restock()">เติมสต็อก</button><button class="btn ghost" onclick="openScanner(restockScan)">สแกนเติม</button></div>
   <div id="plist" class="list"></div>
 </section>
 
@@ -145,6 +157,57 @@ const PAL = ['#ffc2d6','#d3ec9a','#ffd6a5','#bfe6f6','#e6cdf7'];
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let PIN = localStorage.getItem('pin') || '', products = [], cart = {}, ci = 0;
+
+// ===== ออฟไลน์: คิวบิลที่รอส่ง =====
+let queue = [], failed = [], flushing = false;
+try { queue = JSON.parse(localStorage.getItem('queue') || '[]'); } catch (e) {}
+try { failed = JSON.parse(localStorage.getItem('failed') || '[]'); } catch (e) {}
+const saveQueue = () => { localStorage.setItem('queue', JSON.stringify(queue)); renderNet(); };
+const cacheProducts = () => { try { localStorage.setItem('products', JSON.stringify(products)); } catch (e) {} };
+function renderNet() {
+  const el = $('#qstat'); if (!el) return;
+  const off = !navigator.onLine, parts = [];
+  if (off) parts.push('ออฟไลน์ — ขายต่อได้ตามปกติ');
+  if (queue.length) parts.push((off ? '' : 'กำลังส่ง · ') + 'รอส่ง ' + queue.length + ' บิล');
+  if (failed.length) parts.push('ส่งไม่สำเร็จ ' + failed.length + ' บิล (แตะดู)');
+  el.style.display = parts.length ? 'block' : 'none';
+  el.className = 'qstat' + (failed.length ? ' bad' : '');
+  el.textContent = parts.join(' · ');
+}
+function showFailed() {
+  if (!failed.length) return;
+  alert('บิลที่ส่งไม่สำเร็จ (ต้องแก้สต็อกหรือบันทึกเอง):\n' + failed.map(b => new Date(b.ts).toLocaleString('th-TH') + ' — ' +
+    b.items.map(i => ((find(i.code) || {}).name || i.code) + ' ×' + i.qty).join(', ') + ' [' + b.err + ']').join('\n'));
+  failed = []; localStorage.setItem('failed', '[]'); renderNet();
+}
+function applyPending() {   // หักสต็อกของบิลที่ยังไม่ได้ส่งออกจากตัวเลขที่ได้จากเซิร์ฟเวอร์
+  queue.forEach(b => b.items.forEach(i => { const p = find(i.code); if (p) p.stock -= i.qty; }));
+}
+async function flushQueue() {
+  if (flushing || !queue.length) { renderNet(); return; }
+  flushing = true; let got = false;
+  try {
+    while (queue.length) {
+      const b = queue[0]; let r;
+      try { r = await post({ action: 'sell', items: b.items, id: b.id, ts: b.ts }); }
+      catch (e) { break; }   // เน็ตหลุด เก็บไว้ส่งรอบหน้า
+      if (r.error === 'ยังไม่ได้ใส่ PIN' || r.error === 'PIN ไม่ถูกต้อง') { toast(r.error + ' — บิลยังรอส่งอยู่'); break; }
+      queue.shift();
+      if (r.error) {
+        failed.push({ ...b, err: String(r.error) });
+        localStorage.setItem('failed', JSON.stringify(failed));
+        toast('มีบิลบันทึกไม่สำเร็จ: ' + r.error);
+      } else if (r.products) { products = r.products; got = true; }
+      saveQueue();
+    }
+  } finally { flushing = false; }
+  if (got && queue.length) applyPending();
+  cacheProducts(); renderNet(); renderCart(); renderLows(); renderManage();
+  if ($('#v-cat').classList.contains('on')) renderCat();
+}
+window.addEventListener('online', () => { renderNet(); flushQueue(); });
+window.addEventListener('offline', renderNet);
+setInterval(() => { if (queue.length) flushQueue(); }, 30000);
 
 async function get(action, extra = '') {
   const r = await fetch(API + '?action=' + action + extra);
@@ -334,12 +397,11 @@ function checkout() {
   cart = {}; renderCart(); renderLows();
   const ok = $('#ok'); ok.classList.remove('show'); void ok.offsetWidth; ok.classList.add('show');
   setTimeout(() => ok.classList.remove('show'), 800);
-  post({ action: 'sell', items }).then(r => {
-    if (r.error) { toast('บันทึกไม่สำเร็จ: ' + r.error); cart = snap; load(); return; }
-    products = r.products; renderLows();
-    items.map(i => find(i.code)).filter(p => p && p.stock <= p.reorder)
-      .forEach(p => toast('⚠ ' + p.name + ' เหลือ ' + p.stock + ' ชิ้น'));
-  }).catch(() => { toast('ส่งข้อมูลไม่สำเร็จ เช็คอินเทอร์เน็ต'); cart = snap; load(); });
+  items.map(i => find(i.code)).filter(p => p && p.stock <= p.reorder)
+    .forEach(p => toast('⚠ ' + p.name + ' เหลือ ' + p.stock + ' ชิ้น'));
+  // เก็บบิลลงคิวในเครื่องก่อนเสมอ แล้วค่อยส่ง — เน็ตหลุดก็ไม่หาย
+  queue.push({ id: Date.now().toString(36) + Math.random().toString(36).slice(2, 7), items, ts: Date.now() });
+  saveQueue(); cacheProducts(); flushQueue();
 }
 
 // ===== แคตตาล็อก =====
@@ -381,6 +443,37 @@ async function saveProduct() {
   if (r.error) { toast(r.error); return; }
   products = r.products; clearForm(); renderManage(); renderLows(); toast('บันทึกแล้ว');
 }
+// ===== เติมสต็อก =====
+async function doRestock(code, n) {
+  if (queue.length) { await flushQueue(); if (queue.length) { toast('ยังมีบิลรอส่ง ' + queue.length + ' บิล ส่งให้เสร็จก่อนค่อยเติมสต็อก'); return false; } }
+  try { const r = await get('products'); products = r.products || []; }   // อ่านสต็อกล่าสุดก่อนบวก
+  catch (e) { toast('ต้องต่อเน็ตก่อนจึงจะเติมสต็อกได้'); return false; }
+  const p = find(code);
+  if (!p) { toast('ไม่พบรหัส ' + code); return false; }
+  let r;
+  try { r = await post({ action: 'save', product: { ...p, stock: p.stock + n } }); }
+  catch (e) { toast('ส่งข้อมูลไม่สำเร็จ เช็คอินเทอร์เน็ต'); return false; }
+  if (r.error) { toast(r.error); return false; }
+  products = r.products; cacheProducts(); renderManage(); renderLows();
+  toast('เติม ' + p.name + ' +' + n + ' → เหลือ ' + find(p.code).stock + ' ชิ้น');
+  return true;
+}
+async function restock() {
+  const code = $('#f-code').value.trim(), n = parseInt($('#f-add').value, 10);
+  if (!code) { toast('ใส่รหัสสินค้าหรือกดเลือกสินค้าจากรายการก่อน'); return; }
+  if (!(n > 0)) { toast('ใส่จำนวนที่รับเข้า'); return; }
+  if (await doRestock(code, n)) { $('#f-add').value = ''; const p = find(code); if (p) $('#f-stock').value = p.stock; }
+}
+function restockScan(code) {
+  const p = find(code);
+  if (!p) { feedback(false, '✗ ไม่พบรหัส ' + code); return; }
+  closing = true; feedback(true, '✓ ' + p.name);
+  setTimeout(async () => {
+    await closeScanner();
+    const n = parseInt(prompt('เติม "' + p.name + '" กี่ชิ้น? (ตอนนี้มี ' + p.stock + ')'), 10);
+    if (n > 0) doRestock(p.code, n);
+  }, 600);
+}
 function printLabels() {
   if (!products.length) return;
   $('#print').innerHTML = products.map((p, i) => `<div>${esc(p.name)}<br><svg id="pb${i}"></svg></div>`).join('');
@@ -389,25 +482,66 @@ function printLabels() {
 }
 
 // ===== สรุปยอด =====
+let sumR = 'today', sumFrom = '', sumTo = '';
+const RN = { today: 'วันนี้', yest: 'เมื่อวาน', '7d': '7 วัน', '30d': '30 วัน', month: 'เดือนนี้', custom: 'เลือกวัน' };
+const bkk = n => new Date(Date.now() + 7 * 3600e3 + n * 864e5).toISOString().slice(0, 10);   // วันที่ตามเวลาไทย
+const fd = s => new Date(s + 'T12:00:00+07:00').toLocaleDateString('th-TH', { day: 'numeric', month: 'short', year: '2-digit' });
+function sumRange() {
+  const t = bkk(0);
+  return { today: [t, t], yest: [bkk(-1), bkk(-1)], '7d': [bkk(-6), t], '30d': [bkk(-29), t], month: [t.slice(0, 8) + '01', t], custom: [sumFrom || t, sumTo || t] }[sumR];
+}
+function pickRange(k) { sumR = k; loadSummary(); }
+function applyCustom() {
+  sumFrom = $('#s-from').value; sumTo = $('#s-to').value;
+  if (sumFrom && sumTo && sumFrom > sumTo) [sumFrom, sumTo] = [sumTo, sumFrom];
+  loadSummary();
+}
+function chipsHtml() {
+  const [f, t] = sumRange();
+  return '<div class="tabs">' + Object.keys(RN).map(k => `<button class="tab ${k === sumR ? 'on' : ''}" onclick="pickRange('${k}')">${RN[k]}</button>`).join('') + '</div>' +
+    (sumR === 'custom' ? `<div class="row"><input type="date" id="s-from" value="${f}"><input type="date" id="s-to" value="${t}"><button class="btn" onclick="applyCustom()">ดู</button></div>` : '');
+}
 async function loadSummary() {
-  $('#sumBox').innerHTML = '<p class="muted">กำลังโหลด...</p>';
-  const r = await get('summary', '&pin=' + encodeURIComponent(PIN));
+  const [from, to] = sumRange(), head = chipsHtml();
+  $('#sumBox').innerHTML = head + '<p class="muted">กำลังโหลด...</p>';
+  let r;
+  try { r = await get('summary', '&pin=' + encodeURIComponent(PIN) + '&from=' + from + '&to=' + to); }
+  catch (e) { $('#sumBox').innerHTML = head + '<p class="muted">ต้องต่อเน็ตจึงจะดูสรุปยอดได้</p>'; return; }
   if (r.error === 'pin') {
-    const p = prompt('ใส่รหัส PIN ของร้าน'); if (!p) { $('#sumBox').innerHTML = ''; return; }
+    const p = prompt('ใส่รหัส PIN ของร้าน'); if (!p) { $('#sumBox').innerHTML = head; return; }
     PIN = p; localStorage.setItem('pin', p); return loadSummary();
   }
-  $('#sumBox').innerHTML = `<div class="sum">ยอดขายวันนี้<b>${baht(r.total)}</b>ขายได้ ${r.count} ชิ้น</div>` +
-    (r.items.length ? r.items.map(i => `<div class="item"><b>${esc(i.name)}</b><span style="text-align:right">${baht(i.sum)}</span><span class="muted">ขาย ${i.qty} ชิ้น</span></div>`).join('') : '<p class="muted">วันนี้ยังไม่มียอดขาย</p>');
+  const f = r.from || from, t = r.to || to, days = r.days || [];
+  const title = f === t ? (f === bkk(0) ? 'ยอดขายวันนี้' : 'ยอดขาย ' + fd(f)) : 'ยอดขาย ' + fd(f) + ' – ' + fd(t);
+  let extra = '';
+  if (days.length > 1) {
+    const max = Math.max(...days.map(d => d.total), 1), best = days.reduce((a, b) => b.total > a.total ? b : a);
+    const step = days.length > 14 ? 5 : 1;
+    extra = `<div class="bars">${days.map((d, i) => `<div class="bar" title="${fd(d.date)}: ${baht(d.total)}"><div class="bf"><i style="height:${d.total ? Math.max(d.total / max * 100, 3) : 0}%"></i></div><span>${i % step === 0 ? +d.date.slice(8) : ''}</span></div>`).join('')}</div>` +
+      `<div class="grid2"><div class="item"><span class="muted">เฉลี่ยต่อวัน</span><b style="text-align:right">${baht(Math.round(r.total / days.length))}</b></div>` +
+      `<div class="item"><span class="muted">วันขายดีสุด</span><b style="text-align:right">${best.total ? fd(best.date) + ' · ' + baht(best.total) : '-'}</b></div></div>` +
+      `<details class="item" style="display:block"><summary>ยอดรายวัน</summary>${days.slice().reverse().map(d => `<div style="display:flex;justify-content:space-between;padding:6px 0"><span>${fd(d.date)}</span><span>${baht(d.total)} <span class="muted">· ${d.count} ชิ้น</span></span></div>`).join('')}</details>`;
+  }
+  const pend = queue.length ? `<div class="low">มี ${queue.length} บิลรอส่ง ยังไม่รวมในยอดนี้</div>` : '';
+  $('#sumBox').innerHTML = head + pend +
+    `<div class="sum">${title}<b>${baht(r.total)}</b>ขายได้ ${r.count} ชิ้น${r.bills != null ? ' · ' + r.bills + ' บิล' : ''}</div>` + extra +
+    (r.items.length ? '<p class="muted" style="margin:14px 0 8px">แยกตามสินค้า</p>' + r.items.map(i => `<div class="item"><b>${esc(i.name)}</b><span style="text-align:right">${baht(i.sum)}</span><span class="muted">ขาย ${i.qty} ชิ้น</span></div>`).join('') : '<p class="muted">ช่วงนี้ยังไม่มียอดขาย</p>');
 }
 
 async function load() {
   try {
     const r = await get('products'); products = r.products || [];
-    renderCart(); renderLows(); renderManage();
-    if ($('#v-cat').classList.contains('on')) renderCat();
-  } catch (e) { toast('โหลดสินค้าไม่ได้ เช็คลิงก์ API และอินเทอร์เน็ต'); }
+    if (queue.length) applyPending();
+    cacheProducts();
+  } catch (e) {   // ออฟไลน์: ใช้สินค้าที่แคชไว้ครั้งล่าสุด
+    try { products = JSON.parse(localStorage.getItem('products') || '[]'); } catch (e2) {}
+    toast(products.length ? 'ออฟไลน์ ใช้ข้อมูลสินค้าที่บันทึกไว้' : 'โหลดสินค้าไม่ได้ เช็คลิงก์ API และอินเทอร์เน็ต');
+  }
+  renderCart(); renderLows(); renderManage();
+  if ($('#v-cat').classList.contains('on')) renderCat();
 }
-renderCart(); load();
+renderCart(); renderNet(); load().then(flushQueue);
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
 </script>
 </body>
 </html>
