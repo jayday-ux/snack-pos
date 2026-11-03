@@ -43,7 +43,13 @@ nav button{background:none;color:#cfd8c4;padding:12px 4px;font-size:14px}
 nav button.on{color:var(--lime);font-weight:600}
 #scan{position:fixed;top:0;left:0;right:0;height:38vh;background:#000;z-index:20;display:none}
 body.scanning #scan{display:block}
-#reader{width:100%;height:100%}
+#scan{overflow:hidden}
+#reader{width:100%;height:100%;border:0!important}
+#reader video{width:100%!important;height:100%!important;object-fit:cover}
+#reader img{display:none}
+.aim{position:absolute;left:8%;right:8%;top:50%;height:2px;background:rgba(255,60,60,.85);z-index:1;pointer-events:none;box-shadow:0 0 8px rgba(255,60,60,.8)}
+.ctl{position:absolute;left:10px;top:10px;z-index:2;display:flex;gap:8px}
+.ctl button{background:#fff;border-radius:20px;padding:6px 14px}
 #scan::after{content:"";position:absolute;inset:0;pointer-events:none;opacity:0;z-index:1}
 #scan.okf::after{background:rgba(43,138,62,.6);animation:fl .5s}
 #scan.badf::after{background:rgba(217,72,15,.6);animation:fl .5s}
@@ -90,7 +96,7 @@ body.scanning #scan{display:block}
 </style>
 </head>
 <body>
-<div id="scan"><button class="x" onclick="closeScanner()">ปิดกล้อง</button><div id="reader"></div><div id="scanMsg"></div></div>
+<div id="scan"><button class="x" onclick="closeScanner()">ปิดกล้อง</button><div class="ctl"><button id="zoomBtn" style="display:none"></button><button id="torchBtn" style="display:none"></button></div><div id="reader"></div><div class="aim"></div><div id="scanMsg"></div></div>
 <header><h1>POS ร้านขนม</h1><button id="badge" onclick="show('sell')">ตะกร้า 0</button></header>
 
 <section id="v-sell" class="on">
@@ -165,7 +171,12 @@ function imgUrl(u) {
   const m = String(u).match(/\/d\/([\w-]+)/) || String(u).match(/[?&]id=([\w-]+)/);
   return m ? 'https://drive.google.com/thumbnail?id=' + m[1] + '&sz=w800' : u;
 }
-const find = code => products.find(p => p.code === String(code));
+// จับคู่รหัส: ตัดช่องว่าง และยอมให้ UPC-A (12 หลัก) กับ EAN-13 ที่มี 0 นำหน้าเป็นตัวเดียวกัน
+const find = code => {
+  const c = String(code).trim();
+  const strip = s => /^\d+$/.test(s) ? s.replace(/^0+/, '') : s;
+  return products.find(p => p.code === c) || products.find(p => strip(String(p.code).trim()) === strip(c));
+};
 const baht = n => '฿' + Number(n).toLocaleString('th-TH');
 
 // ===== สลับหน้า =====
@@ -191,17 +202,43 @@ async function openScanner(cb) {
     }
     try { actx = actx || new (window.AudioContext || window.webkitAudioContext)(); actx.resume(); } catch (e) {}
     if (!qr.isScanning) {
-      const box = (w, h) => ({ width: Math.floor(w * 0.9), height: Math.floor(h * 0.75) });
-      try {   // ภาพความละเอียดสูง + โฟกัสต่อเนื่อง
-        await qr.start({ facingMode: 'environment' }, { fps: 15, qrbox: box, videoConstraints: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 }, advanced: [{ focusMode: 'continuous' }] } }, onScan);
+      // ไม่กำหนด qrbox = สแกนทั้งเฟรม (บาร์โค้ดเส้นอยู่ตรงไหนก็อ่านได้) / 1280x720 เร็วกว่า 1080p มาก
+      const cfg = { fps: 10, disableFlip: true };
+      try {   // โฟกัสต่อเนื่อง
+        await qr.start({ facingMode: 'environment' }, { ...cfg, videoConstraints: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 }, advanced: [{ focusMode: 'continuous' }] } }, onScan);
       } catch (e1) {
-        await qr.start({ facingMode: 'environment' }, { fps: 15, qrbox: box }, onScan);
+        await qr.start({ facingMode: 'environment' }, cfg, onScan);
       }
     }
+    setupCamTools();
   } catch (e) {
     toast('เปิดกล้องไม่ได้ ให้กด "อนุญาต" การใช้กล้องในเบราว์เซอร์');
     closeScanner();
   }
+}
+// ซูม + ไฟฉาย (ถ้ากล้องรองรับ) — ซูมช่วยให้ยืนห่างแล้วโฟกัสชัด บาร์โค้ดเล็กก็อ่านติด
+let zoomLv = 0;
+function setupCamTools() {
+  const zb = $('#zoomBtn'), tb = $('#torchBtn');
+  zb.style.display = tb.style.display = 'none';
+  try {
+    const cap = qr.getRunningTrackCameraCapabilities();
+    const z = cap.zoomFeature();
+    if (z.isSupported()) {
+      const lv = [z.min(), Math.min(z.max(), Math.max(z.min() * 2, 2)), Math.min(z.max(), Math.max(z.min() * 3, 3))]
+        .filter((v, i, a) => a.indexOf(v) === i);
+      zoomLv = lv.length > 1 ? 1 : 0;
+      const apply = () => { z.apply(lv[zoomLv]); zb.textContent = 'ซูม ×' + (Math.round(lv[zoomLv] / lv[0] * 10) / 10); };
+      zb.onclick = () => { zoomLv = (zoomLv + 1) % lv.length; apply(); };
+      apply(); zb.style.display = 'block';
+    }
+    const t = cap.torchFeature();
+    if (t.isSupported()) {
+      let on = false;
+      tb.onclick = () => { on = !on; t.apply(on); tb.textContent = on ? 'ปิดไฟ' : 'ไฟฉาย'; };
+      tb.textContent = 'ไฟฉาย'; tb.style.display = 'block';
+    }
+  } catch (e) {}
 }
 function onScan(code) {
   if (closing) return;
@@ -320,7 +357,7 @@ function renderCat() {
     <div class="muted" style="color:#a9b59c">${p.stock > 0 ? 'เหลือ ' + p.stock + ' ชิ้น' : 'หมดแล้ว'}</div>
     <div class="bc"><svg id="bcsvg"></svg></div>
     <button class="add" ${p.stock > 0 ? '' : 'disabled'} onclick="addToCart('${esc(p.code)}')">เพิ่มลงตะกร้า</button></div></div>`;
-  try { JsBarcode('#bcsvg', p.code, { format: 'CODE128', height: 44, fontSize: 13, margin: 0 }); } catch (e) {}
+  try { JsBarcode('#bcsvg', p.code, { format: 'CODE128', width: 2, height: 60, fontSize: 13, margin: 10 }); } catch (e) {}
   const on = document.querySelector('.tab.on'); on && on.scrollIntoView({ inline: 'center', block: 'nearest' });
 }
 
@@ -347,7 +384,7 @@ async function saveProduct() {
 function printLabels() {
   if (!products.length) return;
   $('#print').innerHTML = products.map((p, i) => `<div>${esc(p.name)}<br><svg id="pb${i}"></svg></div>`).join('');
-  products.forEach((p, i) => { try { JsBarcode('#pb' + i, p.code, { format: 'CODE128', height: 40, fontSize: 12, margin: 2 }); } catch (e) {} });
+  products.forEach((p, i) => { try { JsBarcode('#pb' + i, p.code, { format: 'CODE128', width: 2, height: 50, fontSize: 12, margin: 12 }); } catch (e) {} });
   window.print();
 }
 
